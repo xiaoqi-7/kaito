@@ -15,8 +15,10 @@ import os
 import sys
 import textwrap
 import time
+from types import SimpleNamespace
 
 import pytest
+import requests
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
 
@@ -29,8 +31,10 @@ from ragengine.guardrails.output_guardrails import (
 )
 from ragengine.guardrails.scanner_schemas import (
     BanSubstringsConfig,
+    BlockedURLPatternConfig,
     ParsedScannerConfig,
     RegexConfig,
+    URLReachabilityConfig,
 )
 from ragengine.models import ChatCompletionResponse
 
@@ -63,6 +67,40 @@ def _ban_subs_cfg(
         type="ban_substrings",
         action_on_hit=action_on_hit,
         config=BanSubstringsConfig(substrings=list(substrings), **kw),
+    )
+
+
+def _url_reachability_cfg(
+    success_status_codes=(200, 201, 202),
+    timeout=5.0,
+    fail_on_request_error=False,
+    action_on_hit="block",
+):
+    return ParsedScannerConfig(
+        type="url_reachability",
+        action_on_hit=action_on_hit,
+        config=URLReachabilityConfig(
+            success_status_codes=list(success_status_codes),
+            timeout=timeout,
+            fail_on_request_error=fail_on_request_error,
+        ),
+    )
+
+
+def _blocked_url_pattern_cfg(
+    blocked_domains=("evil.example",),
+    blocked_patterns=(),
+    action_on_hit="redact",
+    **kw,
+):
+    return ParsedScannerConfig(
+        type="blocked_url_pattern",
+        action_on_hit=action_on_hit,
+        config=BlockedURLPatternConfig(
+            blocked_domains=list(blocked_domains),
+            blocked_patterns=list(blocked_patterns),
+            **kw,
+        ),
     )
 
 
@@ -331,6 +369,37 @@ def test_from_config_skips_invalid_scanners_and_filters_non_string_values(
     assert scanners[1].redact is True
 
 
+def test_from_config_loads_url_reachability_and_blocked_url_pattern_scanners(
+    tmp_path, monkeypatch
+):
+    _write_policy(
+        tmp_path,
+        monkeypatch,
+        """
+        action: redact
+        scanners:
+          - type: url_reachability
+            action: block
+            timeout: 0.5
+            success_status_codes:
+              - 200
+              - 204
+          - type: blocked_url_pattern
+            blocked_domains:
+              - evil.example
+            blocked_patterns:
+              - '(?i)token='
+        """,
+    )
+
+    guardrails = OutputGuardrails.from_config()
+
+    assert guardrails.scanner_configs == (
+        _url_reachability_cfg(success_status_codes=[200, 204], timeout=0.5),
+        _blocked_url_pattern_cfg(blocked_patterns=[r"(?i)token="]),
+    )
+
+
 def test_from_config_with_empty_policy_path_keeps_defaults(monkeypatch):
     monkeypatch.setattr(config, "OUTPUT_GUARDRAILS_ENABLED", True)
     monkeypatch.setattr(config, "OUTPUT_GUARDRAILS_POLICY_PATH", "")
@@ -472,13 +541,62 @@ def test_parse_policy_scanner_configs_rejects_non_bool_flags():
             {"type": "ban_substrings", "substrings": ["a"], "case_sensitive": "false"},
             {"type": "ban_substrings", "substrings": ["a"], "contains_all": 1},
             {"type": "regex", "patterns": ["a"], "is_blocked": "no"},
+            {
+                "type": "url_reachability",
+                "action": "block",
+                "fail_on_request_error": "true",
+            },
+            {
+                "type": "blocked_url_pattern",
+                "blocked_domains": ["a"],
+                "case_sensitive": "false",
+            },
             # Native YAML booleans (already parsed to Python bool) are accepted.
             {"type": "ban_substrings", "substrings": ["a"], "case_sensitive": True},
+            {
+                "type": "url_reachability",
+                "action": "block",
+                "fail_on_request_error": True,
+            },
+            {
+                "type": "blocked_url_pattern",
+                "blocked_domains": ["evil.example"],
+                "case_sensitive": True,
+            },
         ],
         "guardrails.yaml",
     )
 
-    assert parsed == (_ban_subs_cfg(substrings=["a"], case_sensitive=True),)
+    assert parsed == (
+        _ban_subs_cfg(substrings=["a"], case_sensitive=True),
+        _url_reachability_cfg(fail_on_request_error=True),
+        _blocked_url_pattern_cfg(case_sensitive=True),
+    )
+
+
+def test_parse_policy_scanner_configs_rejects_invalid_url_scanner_values():
+    parsed = output_guardrails_module._parse_policy_scanner_configs(
+        [
+            {"type": "url_reachability"},
+            {"type": "url_reachability", "action": "block", "timeout": 0},
+            {"type": "url_reachability", "action": "block", "success_status_codes": []},
+            {
+                "type": "url_reachability",
+                "action": "block",
+                "success_status_codes": [200, "201"],
+            },
+            {"type": "blocked_url_pattern"},
+            {"type": "blocked_url_pattern", "blocked_patterns": ["[bad"]},
+            {"type": "blocked_url_pattern", "blocked_domains": ["evil.example"]},
+            {"type": "url_reachability", "action": "block", "timeout": 1.5},
+        ],
+        "guardrails.yaml",
+    )
+
+    assert parsed == (
+        _blocked_url_pattern_cfg(),
+        _url_reachability_cfg(timeout=1.5),
+    )
 
 
 def test_parse_policy_scanner_configs_skips_redact_incompatible_scanners(
@@ -569,6 +687,28 @@ def test_build_scanners_supports_normalized_ban_substrings_type(
     assert isinstance(scanners[0], FakeBanSubstrings)
     assert scanners[0].substrings == ["secret"]
     assert scanners[0].redact is True
+
+
+def test_build_scanners_builds_url_reachability_and_blocked_url_pattern():
+    guardrails = OutputGuardrails(
+        enabled=True,
+        scanner_configs=(
+            _url_reachability_cfg(timeout=0.25, fail_on_request_error=True),
+            _blocked_url_pattern_cfg(blocked_patterns=[r"(?i)phish"]),
+        ),
+    )
+
+    scanners = guardrails._build_scanners()
+
+    assert len(scanners) == 2
+    assert isinstance(scanners[0], scanner_schemas_module.URLReachabilityOutputAdapter)
+    assert scanners[0].timeout == 0.25
+    assert scanners[0].fail_on_request_error is True
+    assert isinstance(
+        scanners[1], scanner_schemas_module.BlockedURLPatternOutputAdapter
+    )
+    assert scanners[1].blocked_domains == ("evil.example",)
+    assert len(scanners[1].blocked_patterns) == 1
 
 
 def test_build_scanners_uses_per_scanner_action(fake_llm_guard_scanners):
@@ -726,6 +866,119 @@ def test_guard_response_applies_action(
 
     out = guardrails.guard_response(_make_response("dirty"), {"messages": []})
     assert out.choices[0].message.content == expected_content
+
+
+def test_guard_response_with_real_blocked_url_pattern_redacts_output(
+    tmp_path, monkeypatch
+):
+    _write_policy(
+        tmp_path,
+        monkeypatch,
+        """
+        action: redact
+        scanners:
+          - type: blocked_url_pattern
+            blocked_domains:
+              - evil.example
+        """,
+    )
+
+    guardrails = OutputGuardrails.from_config()
+
+    out = guardrails.guard_response(
+        _make_response("visit https://evil.example/path now"), {"messages": []}
+    )
+
+    assert out.choices[0].message.content == "visit [REDACTED_URL] now"
+
+
+def test_guard_response_with_real_url_reachability_blocks_unreachable_url(
+    tmp_path, monkeypatch
+):
+    _write_policy(
+        tmp_path,
+        monkeypatch,
+        """
+        action: redact
+        blockMessage: unreachable-url
+        scanners:
+          - type: url_reachability
+            action: block
+            timeout: 0.1
+        """,
+    )
+    monkeypatch.setattr(
+        scanner_schemas_module.requests,
+        "get",
+        lambda url, timeout: SimpleNamespace(status_code=404),
+    )
+
+    guardrails = OutputGuardrails.from_config()
+
+    out = guardrails.guard_response(
+        _make_response("visit https://example.invalid now"), {"messages": []}
+    )
+
+    assert out.choices[0].message.content == "unreachable-url"
+
+
+def test_guard_response_with_url_reachability_ignores_request_errors_by_default(
+    tmp_path, monkeypatch
+):
+    _write_policy(
+        tmp_path,
+        monkeypatch,
+        """
+        scanners:
+          - type: url_reachability
+            action: block
+            timeout: 0.1
+        """,
+    )
+
+    def _timeout(url, timeout):
+        raise requests.Timeout("timed out")
+
+    monkeypatch.setattr(scanner_schemas_module.requests, "get", _timeout)
+
+    guardrails = OutputGuardrails.from_config()
+
+    out = guardrails.guard_response(
+        _make_response("visit https://example.com now"), {"messages": []}
+    )
+
+    assert out.choices[0].message.content == "visit https://example.com now"
+
+
+def test_guard_response_with_url_reachability_can_fail_closed_on_request_error(
+    tmp_path, monkeypatch
+):
+    _write_policy(
+        tmp_path,
+        monkeypatch,
+        """
+        action: redact
+        blockMessage: request-error-url
+        scanners:
+          - type: url_reachability
+            action: block
+            timeout: 0.1
+            fail_on_request_error: true
+        """,
+    )
+
+    def _network_error(url, timeout):
+        raise requests.ConnectionError("network down")
+
+    monkeypatch.setattr(scanner_schemas_module.requests, "get", _network_error)
+
+    guardrails = OutputGuardrails.from_config()
+
+    out = guardrails.guard_response(
+        _make_response("visit https://example.com now"), {"messages": []}
+    )
+
+    assert out.choices[0].message.content == "request-error-url"
 
 
 def test_guard_response_applies_mixed_scanner_actions_in_order(monkeypatch):

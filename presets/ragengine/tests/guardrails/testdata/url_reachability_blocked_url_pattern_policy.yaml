@@ -1,0 +1,13 @@
+action: redact
+scanners:
+  - type: url_reachability
+    action: block
+    timeout: 0.5
+    success_status_codes:
+      - 200
+      - 204
+  - type: blocked_url_pattern
+    blocked_domains:
+      - evil.example
+    blocked_patterns:
+      - '(?i)token='
