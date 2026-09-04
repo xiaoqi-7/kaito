@@ -19,6 +19,28 @@ PYTHONPATH=presets:$PYTHONPATH python -m benchmarks.ragengine_guardrails.benchma
 PYTHONPATH=presets:$PYTHONPATH python -m benchmarks.ragengine_guardrails.bench_scaling
 ```
 
+## Reproducing Figure 1
+
+Figure 1 and its absolute timing results were generated with Python 3.12 on
+WSL2 Linux 5.15 using an AMD Ryzen 9 8945HS CPU (8 cores, 16 threads) and
+24 GB RAM. The benchmark uses output sizes from 1,024 to 16,384 tokens, a
+20-character streaming chunk size, 10 warmup iterations, and 100 measured
+iterations per configuration.
+
+Run the Figure 1 benchmark from the repository root:
+
+```bash
+PYTHONPATH=presets:$PYTHONPATH python -m benchmarks.ragengine_guardrails.plot_overhead
+```
+
+The command writes the raw measurements to
+`results/overhead_vs_tokens.json`. Regenerate the chart from those
+measurements with:
+
+```bash
+python -m benchmarks.ragengine_guardrails.plot_figure
+```
+
 ## E2E Benchmark with Real Models
 
 Requires Azure AI Foundry serverless API endpoints.
