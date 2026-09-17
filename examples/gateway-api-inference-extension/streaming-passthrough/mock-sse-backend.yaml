@@ -1,0 +1,129 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mock-sse-backend-script
+  namespace: default
+data:
+  app.py: |
+    #!/usr/bin/env python3
+    import json
+    import time
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    class MockSSEHandler(BaseHTTPRequestHandler):
+      def do_POST(self):
+        content_length = int(self.headers.get('content-length', 0))
+        body = self.rfile.read(content_length).decode('utf-8')
+
+        try:
+          request = json.loads(body)
+        except:
+          self.send_response(400)
+          self.end_headers()
+          return
+
+        # Check if streaming is requested
+        stream = request.get('stream', False)
+
+        if stream:
+          # SSE streaming response
+          self.send_response(200)
+          self.send_header('content-type', 'text/event-stream')
+          self.send_header('cache-control', 'no-cache')
+          self.send_header('connection', 'keep-alive')
+          self.end_headers()
+
+          # Send SSE chunks
+          chunks = [
+            '{"choices":[{"index":0,"delta":{"role":"assistant","content":"hello "},"finish_reason":null}]}\n',
+            '{"choices":[{"index":0,"delta":{"content":"from "},"finish_reason":null}]}\n',
+            '{"choices":[{"index":0,"delta":{"content":"streaming "},"finish_reason":null}]}\n',
+            '{"choices":[{"index":0,"delta":{"content":"backend"},"finish_reason":null}]}\n',
+            '{"choices":[{"index":0,"delta":{"content":" ✨"},"finish_reason":"stop"}]}\n',
+          ]
+
+          for chunk in chunks:
+            line = f"data: {chunk.strip()}\n\n"
+            self.wfile.write(line.encode('utf-8'))
+            self.wfile.flush()
+            time.sleep(0.05)  # Small delay between chunks
+
+          # Send [DONE]
+          self.wfile.write(b"data: [DONE]\n\n")
+          self.wfile.flush()
+        else:
+          # Non-streaming response
+          response = {
+            'choices': [
+              {'message': {'content': 'hello from mock backend'}}
+            ]
+          }
+
+          self.send_response(200)
+          self.send_header('content-type', 'application/json')
+          response_body = json.dumps(response).encode('utf-8')
+          self.send_header('content-length', str(len(response_body)))
+          self.end_headers()
+          self.wfile.write(response_body)
+
+      def log_message(self, format, *args):
+        pass  # Suppress logging
+
+    if __name__ == '__main__':
+      server = HTTPServer(('0.0.0.0', 8080), MockSSEHandler)
+      server.serve_forever()
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-sse-backend
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-sse-backend
+  template:
+    metadata:
+      labels:
+        app: mock-sse-backend
+    spec:
+      containers:
+      - name: backend
+        image: python:3.11-slim
+        command:
+        - python3
+        - /app/app.py
+        volumeMounts:
+        - name: app-script
+          mountPath: /app
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+      volumes:
+      - name: app-script
+        configMap:
+          name: mock-sse-backend-script
+          defaultMode: 0755
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-sse-backend
+  namespace: default
+spec:
+  selector:
+    app: mock-sse-backend
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: ClusterIP

@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""
+Streaming passthrough ext_proc server
+Purpose: Validate that Envoy ext_proc can sit in streaming response path
+without breaking the stream.
+
+Processing mode: FULL_DUPLEX_STREAMED
+Response body: Pass through each chunk as-is, just log
+"""
+
+import asyncio
+import logging
+from concurrent import futures
+import grpc
+from envoy.service.ext_proc.v3 import external_processor_pb2, external_processor_pb2_grpc
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class StreamingPassthroughService(external_processor_pb2_grpc.ExternalProcessorServicer):
+    """
+    Minimal ext_proc service for streaming validation.
+    Just logs chunks and returns them as-is.
+    """
+
+    async def Process(self, request_iterator, context):
+        """
+        Bidirectional streaming RPC for ext_proc
+        """
+        chunk_count = 0
+        total_bytes = 0
+
+        async for request in request_iterator:
+            chunk_count += 1
+
+            # Log request structure
+            if request.HasField('response_headers'):
+                logger.info(f"[Chunk {chunk_count}] Response headers received")
+                yield external_processor_pb2.ProcessingResponse()
+
+            elif request.HasField('response_body'):
+                body_msg = request.response_body
+                chunk_size = len(body_msg.body)
+                total_bytes += chunk_size
+                end_of_stream = body_msg.end_of_stream
+
+                # Parse SSE line
+                try:
+                    chunk_text = body_msg.body.decode('utf-8', errors='replace')
+                    chunk_preview = chunk_text[:80].replace('\n', '\\n')
+                except:
+                    chunk_preview = "(binary)"
+
+                logger.info(
+                    f"[Chunk {chunk_count}] body_size={chunk_size}B, "
+                    f"end_of_stream={end_of_stream}, "
+                    f"preview='{chunk_preview}'"
+                )
+
+                # PASSTHROUGH: Return unchanged
+                yield external_processor_pb2.ProcessingResponse()
+
+            else:
+                # Other fields (trailers, etc.) - just pass
+                yield external_processor_pb2.ProcessingResponse()
+
+        logger.info(
+            f"Stream complete: {chunk_count} chunks, {total_bytes} total bytes"
+        )
+
+
+async def serve():
+    """Start gRPC server"""
+    server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=10))
+    external_processor_pb2_grpc.add_ExternalProcessorServicer_to_server(
+        StreamingPassthroughService(),
+        server
+    )
+    server.add_insecure_port('[::]:9000')
+    await server.start()
+    logger.info("✓ Streaming passthrough ext_proc started on port 9000")
+    logger.info("  Mode: FULL_DUPLEX_STREAMED")
+    logger.info("  Action: Log chunks, pass through unchanged")
+    await server.wait_for_termination()
+
+
+if __name__ == '__main__':
+    asyncio.run(serve())
