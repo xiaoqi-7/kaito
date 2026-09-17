@@ -1,0 +1,105 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: t2-ext-proc
+  namespace: default
+spec:
+  selector:
+    app: t2-ext-proc
+  ports:
+  - name: grpc
+    port: 9000
+    targetPort: 9000
+  type: ClusterIP
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: t2-ext-proc
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: t2-ext-proc
+  template:
+    metadata:
+      labels:
+        app: t2-ext-proc
+    spec:
+      containers:
+      - name: ext-proc
+        image: yiqi685/llm-guard-ext-proc:streaming
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 9000
+          name: grpc
+        env:
+        - name: T_PASSTHROUGH
+          value: "true"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: t2-ext-proc
+  namespace: default
+spec:
+  workloadSelector:
+    labels:
+      gateway.networking.k8s.io/gateway-name: inference-gateway
+  configPatches:
+  - applyTo: CLUSTER
+    patch:
+      operation: ADD
+      value:
+        name: t2_ext_proc
+        type: STRICT_DNS
+        connect_timeout: 2s
+        typed_extension_protocol_options:
+          envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+            "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+            explicit_http_config:
+              http2_protocol_options: {}
+        load_assignment:
+          cluster_name: t2_ext_proc
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: t2-ext-proc.default.svc.cluster.local
+                    port_value: 9000
+
+  - applyTo: HTTP_FILTER
+    match:
+      context: GATEWAY
+      listener:
+        filterChain:
+          filter:
+            name: envoy.filters.network.http_connection_manager
+            subFilter:
+              name: envoy.filters.http.router
+    patch:
+      operation: INSERT_BEFORE
+      value:
+        name: envoy.filters.http.ext_proc
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+          grpc_service:
+            envoy_grpc:
+              cluster_name: t2_ext_proc
+            timeout: 30s
+          processing_mode:
+            request_header_mode: SKIP
+            request_body_mode: NONE
+            response_header_mode: SEND
+            response_body_mode: FULL_DUPLEX_STREAMED
+            response_trailer_mode: SKIP
+          failure_mode_allow: false
