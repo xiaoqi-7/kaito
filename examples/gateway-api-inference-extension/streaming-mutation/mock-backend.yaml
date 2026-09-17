@@ -1,0 +1,88 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mock-simple-backend-script
+  namespace: default
+data:
+  app.py: |
+    #!/usr/bin/env python3
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    import time
+
+    class SimpleStreamHandler(BaseHTTPRequestHandler):
+      def do_POST(self):
+        self.send_response(200)
+        self.send_header('content-type', 'text/plain')
+        self.send_header('transfer-encoding', 'chunked')
+        self.end_headers()
+
+        # Send simple line-based chunks
+        chunks = [b'hello\n', b'foo\n', b'world\n']
+
+        for chunk in chunks:
+          # Write chunk as-is
+          self.wfile.write(chunk)
+          self.wfile.flush()
+          time.sleep(0.1)  # Small delay between chunks
+
+      def log_message(self, format, *args):
+        pass
+
+    if __name__ == '__main__':
+      server = HTTPServer(('0.0.0.0', 8080), SimpleStreamHandler)
+      server.serve_forever()
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-simple-backend
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-simple-backend
+  template:
+    metadata:
+      labels:
+        app: mock-simple-backend
+    spec:
+      containers:
+      - name: backend
+        image: python:3.11-slim
+        command:
+        - python3
+        - /app/app.py
+        volumeMounts:
+        - name: app-script
+          mountPath: /app
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+      volumes:
+      - name: app-script
+        configMap:
+          name: mock-simple-backend-script
+          defaultMode: 0755
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-simple-backend
+  namespace: default
+spec:
+  selector:
+    app: mock-simple-backend
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: ClusterIP
